@@ -1,36 +1,5 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Development tools
-tools/7zip/
-tools/__pycache__/
-tools/*.pyc
-tmp/
-
-# Source help files (reference only, not needed for runtime)
-source/
+# Rust build outputs
+target/
 
 # IDE
 .vscode/
@@ -38,16 +7,10 @@ source/
 *.swp
 *.swo
 *~
-.DS_Store
 
 # OS
-Thumbs.db
 .DS_Store
-
-# Test files
-.pytest_cache/
-.coverage
-htmlcov/
+Thumbs.db
 
 # Environment variables
 .env
@@ -56,19 +19,8 @@ htmlcov/
 # Cursor
 .cursor/
 
-# Rust build outputs
-target/
+# Temp
+tmp/
 
-# Legacy JavaScript tooling artifacts
-node_modules/
-package-lock.json
-npm-shrinkwrap.json
-yarn.lock
-pnpm-lock.yaml
-dist/
-coverage/
-*.tsbuildinfo
-
-# POSIX launcher permission
+# POSIX launcher
 bin/solidworks-mcp
-

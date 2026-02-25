@@ -39,10 +39,10 @@ fn main() -> Result<()> {
         }
 
         if let Some(response) = server.handle_line(trimmed) {
-            if let Ok(serialized) = serde_json::to_string(&response) {
-                let _ = writeln!(stdout, "{}", serialized);
-                let _ = stdout.flush();
-            }
+            let serialized = serde_json::to_string(&response)
+                .context("failed to serialize JSON-RPC response")?;
+            writeln!(stdout, "{}", serialized)?;
+            stdout.flush()?;
         }
     }
 

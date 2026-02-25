@@ -16,23 +16,6 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub const INDEX_SCHEMA_VERSION: u32 = 2;
 const INDEX_MAGIC: &[u8; 8] = b"SWIDXV2\0";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DocFormat {
-    #[default]
-    Json,
-}
-
-impl DocFormat {
-    pub fn as_str(self) -> &'static str {
-        "json"
-    }
-
-    pub fn from_json_value(_value: Option<&Value>, _fallback: Self) -> Self {
-        Self::Json
-    }
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SearchDocument {
     pub title: Option<String>,
@@ -160,7 +143,7 @@ impl BuiltIndex {
 }
 
 fn non_zero(value: usize) -> NonZeroUsize {
-    NonZeroUsize::new(value).unwrap_or_else(|| NonZeroUsize::new(1).expect("non-zero literal"))
+    NonZeroUsize::new(value).expect("cache size must be > 0")
 }
 
 #[derive(Clone)]
@@ -336,7 +319,6 @@ impl DataStore {
         query
             .to_ascii_lowercase()
             .split_whitespace()
-            .filter(|entry| !entry.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
     }

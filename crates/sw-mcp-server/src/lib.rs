@@ -234,7 +234,14 @@ impl MCPServer {
             _ => {}
         }
 
+        let (docset_filter, post_filter_docsets) = if docsets.len() == 1 {
+            (Some(docsets[0].clone()), HashSet::new())
+        } else {
+            (None, docsets.into_iter().collect::<HashSet<_>>())
+        };
+
         let options = SearchOptions {
+            docset: docset_filter,
             categories,
             interface_name,
             limit: None,
@@ -243,9 +250,10 @@ impl MCPServer {
 
         let mut results = self.store.search_api_scored(&query, &options);
 
-        if !docsets.is_empty() {
-            let filter = docsets.into_iter().collect::<HashSet<_>>();
-            results.retain(|entry| filter.contains(entry.doc.docset.as_deref().unwrap_or_default()));
+        if !post_filter_docsets.is_empty() {
+            results.retain(|entry| {
+                post_filter_docsets.contains(entry.doc.docset.as_deref().unwrap_or_default())
+            });
         }
 
         if !types.is_empty() {
