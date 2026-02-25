@@ -56,7 +56,10 @@ htmlcov/
 # Cursor
 .cursor/
 
-# JavaScript tooling (Bun-only workflow)
+# Rust build outputs
+target/
+
+# Legacy JavaScript tooling artifacts
 node_modules/
 package-lock.json
 npm-shrinkwrap.json
@@ -65,3 +68,7 @@ pnpm-lock.yaml
 dist/
 coverage/
 *.tsbuildinfo
+
+# POSIX launcher permission
+bin/solidworks-mcp
+

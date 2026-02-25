@@ -1,5 +1,0 @@
-#!/usr/bin/env bun
-
-import { main } from "../server/solidworks_mcp_server";
-
-await main();
