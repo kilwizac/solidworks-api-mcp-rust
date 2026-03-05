@@ -5,13 +5,18 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use sw_core::{
-    compute_corpus_fingerprint, extract_example_mapping, read_index_artifact, read_json,
-    require_directory, write_index_artifact, BuiltIndex, DocsetStats, RootIndex, SearchDocument,
-    SearchIndex, INDEX_SCHEMA_VERSION,
+    build_search_assets, compute_corpus_fingerprint, default_profile_catalog,
+    extract_example_mapping, load_referenced_payloads, read_index_artifact, read_json,
+    require_directory, validate_built_index, write_index_artifact, BuiltIndex, DocsetStats,
+    RootIndex, SearchDocument, SearchIndex, INDEX_ARTIFACT_NAME, INDEX_METADATA_NAME,
+    INDEX_SCHEMA_VERSION,
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "sw-indexer", about = "Build and validate SolidWorks MCP binary index artifacts")]
+#[command(
+    name = "sw-indexer",
+    about = "Build and validate SolidWorks MCP binary index artifacts"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -34,11 +39,11 @@ enum Command {
 }
 
 fn default_output(input: &Path) -> PathBuf {
-    input.join("index-v2.swidx")
+    input.join(INDEX_ARTIFACT_NAME)
 }
 
 fn default_meta(input: &Path) -> PathBuf {
-    input.join("index-v2.meta.json")
+    input.join(INDEX_METADATA_NAME)
 }
 
 fn load_search(path: &Path) -> Result<SearchIndex> {
@@ -75,8 +80,12 @@ fn collect_examples_map(input: &Path) -> Result<BTreeMap<String, Vec<String>>> {
         return Ok(BTreeMap::new());
     }
 
-    let value: Value = read_json(&mapping_path)
-        .with_context(|| format!("failed to load examples mapping: {}", mapping_path.display()))?;
+    let value: Value = read_json(&mapping_path).with_context(|| {
+        format!(
+            "failed to load examples mapping: {}",
+            mapping_path.display()
+        )
+    })?;
 
     let lines = value
         .get("body")
@@ -120,6 +129,32 @@ fn collect_docset_stats(root: &RootIndex, search: &SearchIndex) -> BTreeMap<Stri
     stats
 }
 
+fn profile_metadata(index: &BuiltIndex) -> BTreeMap<String, Value> {
+    index
+        .profiles
+        .iter()
+        .map(|(name, profile)| {
+            let doc_count = index
+                .profile_stats
+                .get(name)
+                .map(|entry| entry.doc_count)
+                .unwrap_or_default();
+            (
+                name.clone(),
+                json!({
+                    "description": profile.description,
+                    "doc_count": doc_count,
+                    "docsets": profile.docsets,
+                    "categories_any": profile.categories_any,
+                    "categories_all": profile.categories_all,
+                    "interfaces": profile.interfaces,
+                    "types": profile.types,
+                }),
+            )
+        })
+        .collect()
+}
+
 fn build(input: PathBuf, output: Option<PathBuf>, meta: Option<PathBuf>) -> Result<()> {
     require_directory(&input, "input corpus")?;
     require_directory(&input.join("json"), "input corpus json directory")?;
@@ -134,6 +169,9 @@ fn build(input: PathBuf, output: Option<PathBuf>, meta: Option<PathBuf>) -> Resu
     let progguide_titles = collect_progguide_titles(&search);
     let docset_stats = collect_docset_stats(&root, &search);
     let fingerprint = compute_corpus_fingerprint(&input)?;
+    let profiles = default_profile_catalog();
+    let search_assets = build_search_assets(&search, &profiles);
+    let doc_payloads = load_referenced_payloads(&input, &root)?;
 
     let built = BuiltIndex::new(
         fingerprint.clone(),
@@ -142,13 +180,18 @@ fn build(input: PathBuf, output: Option<PathBuf>, meta: Option<PathBuf>) -> Resu
         search,
         examples_map,
         progguide_titles,
+        profiles,
+        search_assets,
+        doc_payloads,
     );
+    let summary = validate_built_index(&built)?;
 
     write_index_artifact(&output, &built)?;
 
     if let Some(parent) = meta.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create metadata directory: {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create metadata directory: {}", parent.display())
+        })?;
     }
 
     let output_text = output.to_string_lossy().to_string();
@@ -158,9 +201,15 @@ fn build(input: PathBuf, output: Option<PathBuf>, meta: Option<PathBuf>) -> Resu
         "corpus_fingerprint": fingerprint,
         "artifact": output_text,
         "docsets": built.docset_stats,
+        "profiles": profile_metadata(&built),
+        "payloads": summary.payload_count,
+        "exact_keys": summary.exact_key_count,
     });
-    fs::write(&meta, serde_json::to_vec_pretty(&metadata).context("failed to serialize metadata")?)
-        .with_context(|| format!("failed to write metadata file: {}", meta.display()))?;
+    fs::write(
+        &meta,
+        serde_json::to_vec_pretty(&metadata).context("failed to serialize metadata")?,
+    )
+    .with_context(|| format!("failed to write metadata file: {}", meta.display()))?;
 
     println!("Index written: {}", output.display());
     println!("Metadata written: {}", meta.display());
@@ -169,23 +218,16 @@ fn build(input: PathBuf, output: Option<PathBuf>, meta: Option<PathBuf>) -> Resu
 
 fn validate(index_path: PathBuf) -> Result<()> {
     let index = read_index_artifact(&index_path)?;
-
-    let doc_count = index
-        .search_index
-        .documents
-        .as_ref()
-        .map(|entries| entries.len())
-        .unwrap_or(0);
-
-    if doc_count == 0 {
-        anyhow::bail!("index appears incomplete (docs: {})", doc_count);
-    }
+    let summary = validate_built_index(&index)?;
 
     println!("Index OK: {}", index_path.display());
     println!("Schema: {}", index.schema_version);
     println!("Generated: {}", index.generated_at);
     println!("Fingerprint: {}", index.corpus_fingerprint);
-    println!("Docs: {}", doc_count);
+    println!("Docs: {}", summary.doc_count);
+    println!("Profiles: {}", summary.profile_count);
+    println!("Embedded payloads: {}", summary.payload_count);
+    println!("Exact keys: {}", summary.exact_key_count);
     println!("Examples map keys: {}", index.examples_map.len());
     Ok(())
 }
@@ -199,5 +241,146 @@ fn main() -> Result<()> {
             meta,
         } => build(input, output, meta),
         Command::Validate { index } => validate(index),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sw_core::INDEX_ARTIFACT_NAME;
+    use tempfile::tempdir;
+
+    fn write_json(path: &Path, value: &Value) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    fn create_test_corpus(root: &Path) {
+        write_json(
+            &root.join("json/_index.json"),
+            &json!({
+                "docsets": {
+                    "sldworksapi": {
+                        "interfaces": {
+                            "IModelDoc2": {
+                                "file": "json/sldworksapi/interfaces/IModelDoc2/_interface.json",
+                                "members": {
+                                    "Save3": "json/sldworksapi/interfaces/IModelDoc2/Save3.json"
+                                }
+                            }
+                        }
+                    },
+                    "swconst": {
+                        "enums": {
+                            "swAddMateError_e": "json/swconst/enums/swAddMateError_e.json"
+                        }
+                    }
+                }
+            }),
+        );
+
+        write_json(
+            &root.join("json/_search_index.json"),
+            &json!({
+                "documents": [
+                    {
+                        "id": "IModelDoc2.Save3",
+                        "path": "json/sldworksapi/interfaces/IModelDoc2/Save3.json",
+                        "type": "method",
+                        "interface": "IModelDoc2",
+                        "title": "Save3",
+                        "summary": "Saves the current document.",
+                        "docset": "sldworksapi",
+                        "keywords": ["save", "document", "imodeldoc2"],
+                        "categories": ["documents", "file-io"]
+                    },
+                    {
+                        "id": "swAddMateError_e",
+                        "path": "json/swconst/enums/swAddMateError_e.json",
+                        "type": "enum",
+                        "title": "swAddMateError_e",
+                        "summary": "Status after adding or editing a mate.",
+                        "docset": "swconst",
+                        "keywords": ["mate", "error"],
+                        "categories": ["constants"]
+                    },
+                    {
+                        "id": "addin-best-practices",
+                        "path": "json/progguide/patterns/addin-best-practices.json",
+                        "type": "pattern",
+                        "title": "Add-in Best Practices",
+                        "summary": "Overview for add-ins.",
+                        "docset": "progguide",
+                        "keywords": ["addin", "application"],
+                        "categories": ["documents"]
+                    }
+                ]
+            }),
+        );
+
+        write_json(
+            &root.join("json/sldworksapi/interfaces/IModelDoc2/_interface.json"),
+            &json!({
+                "title": "IModelDoc2",
+                "description": "Document interface."
+            }),
+        );
+        write_json(
+            &root.join("json/sldworksapi/interfaces/IModelDoc2/Save3.json"),
+            &json!({
+                "title": "IModelDoc2.Save3",
+                "description": "Saves the current document.",
+                "examples": [{ "title": "Save File (C#)" }]
+            }),
+        );
+        write_json(
+            &root.join("json/swconst/enums/swAddMateError_e.json"),
+            &json!({
+                "title": "swAddMateError_e",
+                "values": [{ "member": "swAddMateError_NoError", "value": "1" }]
+            }),
+        );
+        write_json(
+            &root.join("json/progguide/patterns/addin-best-practices.json"),
+            &json!({
+                "title": "Add-in Best Practices",
+                "body": []
+            }),
+        );
+        write_json(
+            &root.join("json/sldworksapi/patterns/examples-to-members.json"),
+            &json!({
+                "body": [
+                    "## Add-in Best Practices",
+                    "- `IModelDoc2.Save3`"
+                ]
+            }),
+        );
+    }
+
+    #[test]
+    fn build_and_validate_round_trip() {
+        let temp = tempdir().unwrap();
+        create_test_corpus(temp.path());
+
+        build(temp.path().to_path_buf(), None, None).unwrap();
+        let index_path = temp.path().join(INDEX_ARTIFACT_NAME);
+
+        validate(index_path.clone()).unwrap();
+
+        let index = read_index_artifact(&index_path).unwrap();
+        assert!(index
+            .doc_payloads
+            .contains_key("json/sldworksapi/interfaces/IModelDoc2/Save3.json"));
+        assert!(index.profiles.contains_key("documents_file_io"));
+        assert_eq!(
+            index
+                .profile_stats
+                .get("documents_file_io")
+                .map(|entry| entry.doc_count),
+            Some(1)
+        );
     }
 }

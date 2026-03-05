@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
@@ -13,11 +13,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-pub const INDEX_SCHEMA_VERSION: u32 = 2;
-const INDEX_MAGIC: &[u8; 8] = b"SWIDXV2\0";
+pub const INDEX_SCHEMA_VERSION: u32 = 3;
+pub const INDEX_ARTIFACT_NAME: &str = "index-v3.swidx";
+pub const INDEX_METADATA_NAME: &str = "index-v3.meta.json";
+const INDEX_MAGIC: &[u8; 8] = b"SWIDXV3\0";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SearchDocument {
+    pub id: Option<String>,
+    pub path: Option<String>,
     pub title: Option<String>,
     pub summary: Option<String>,
     pub keywords: Option<Vec<String>>,
@@ -27,9 +31,9 @@ pub struct SearchDocument {
     #[serde(rename = "type")]
     pub doc_type: Option<String>,
     pub docset: Option<String>,
+    pub parameters: Option<Vec<String>>,
+    pub returns: Option<String>,
     pub href: Option<String>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 impl SearchDocument {
@@ -65,8 +69,6 @@ impl SearchDocument {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SearchIndex {
     pub documents: Option<Vec<SearchDocument>>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -74,27 +76,22 @@ pub struct InterfaceIndexEntry {
     pub file: Option<String>,
     pub members: Option<BTreeMap<String, String>>,
     pub member_count: Option<u64>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DocsetIndex {
     pub interfaces: Option<BTreeMap<String, InterfaceIndexEntry>>,
     pub enums: Option<BTreeMap<String, String>>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RootIndex {
     pub docsets: Option<BTreeMap<String, DocsetIndex>>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchResult {
+    pub doc_id: usize,
     pub score: i32,
     pub doc: SearchDocument,
 }
@@ -106,19 +103,130 @@ pub struct DocsetStats {
     pub enum_count: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProfileDefinition {
+    pub description: String,
+    pub docsets: Vec<String>,
+    pub categories_any: Vec<String>,
+    pub categories_all: Vec<String>,
+    pub interfaces: Vec<String>,
+    pub types: Vec<String>,
+    pub title_terms: Vec<String>,
+    pub keyword_terms: Vec<String>,
+}
+
+impl ProfileDefinition {
+    pub fn matches(&self, doc: &SearchDocument) -> bool {
+        let docset = doc.docset_str().to_ascii_lowercase();
+        let doc_type = doc.doc_type_str().to_ascii_lowercase();
+        let interface_name = doc.interface_str().to_ascii_lowercase();
+        let title = doc.title_str().to_ascii_lowercase();
+        let keywords = doc
+            .keywords_slice()
+            .iter()
+            .map(|entry| entry.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let categories = doc
+            .categories_slice()
+            .iter()
+            .map(|entry| entry.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+
+        if !self.docsets.is_empty() && !self.docsets.iter().any(|entry| entry == &docset) {
+            return false;
+        }
+        if !self.types.is_empty() && !self.types.iter().any(|entry| entry == &doc_type) {
+            return false;
+        }
+        if !self.interfaces.is_empty()
+            && !self.interfaces.iter().any(|entry| entry == &interface_name)
+        {
+            return false;
+        }
+        if !self.categories_all.is_empty()
+            && !self
+                .categories_all
+                .iter()
+                .all(|entry| categories.iter().any(|candidate| candidate == entry))
+        {
+            return false;
+        }
+        if !self.categories_any.is_empty()
+            && !self
+                .categories_any
+                .iter()
+                .any(|entry| categories.iter().any(|candidate| candidate == entry))
+        {
+            return false;
+        }
+        if !self.title_terms.is_empty()
+            && !self.title_terms.iter().any(|entry| title.contains(entry))
+        {
+            return false;
+        }
+        if !self.keyword_terms.is_empty()
+            && !self
+                .keyword_terms
+                .iter()
+                .any(|entry| keywords.iter().any(|candidate| candidate.contains(entry)))
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProfileStats {
+    pub doc_count: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PreparedSearchRow {
+    pub doc_id: usize,
+    pub docset: String,
+    pub doc_type: String,
+    pub interface_name: String,
+    pub categories: Vec<String>,
+    pub hay_title: String,
+    pub hay_summary: String,
+    pub hay_keywords: String,
+    pub hay_categories: String,
+    pub hay_interface: String,
+    pub hay_type: String,
+    pub exact_keys: Vec<String>,
+    pub profiles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SearchBuildAssets {
+    pub prepared_search_rows: Vec<PreparedSearchRow>,
+    pub exact_lookup: BTreeMap<String, Vec<usize>>,
+    pub profile_doc_ids: BTreeMap<String, Vec<usize>>,
+    pub profile_stats: BTreeMap<String, ProfileStats>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BuiltIndex {
     pub schema_version: u32,
     pub generated_at: String,
     pub corpus_fingerprint: String,
     pub docset_stats: BTreeMap<String, DocsetStats>,
+    pub profile_stats: BTreeMap<String, ProfileStats>,
+    pub profiles: BTreeMap<String, ProfileDefinition>,
     pub root_index: RootIndex,
     pub search_index: SearchIndex,
+    pub prepared_search_rows: Vec<PreparedSearchRow>,
+    pub exact_lookup: BTreeMap<String, Vec<usize>>,
+    pub profile_doc_ids: BTreeMap<String, Vec<usize>>,
     pub examples_map: BTreeMap<String, Vec<String>>,
     pub progguide_titles: BTreeMap<String, SearchDocument>,
+    pub doc_payloads: BTreeMap<String, String>,
 }
 
 impl BuiltIndex {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         corpus_fingerprint: String,
         docset_stats: BTreeMap<String, DocsetStats>,
@@ -126,6 +234,9 @@ impl BuiltIndex {
         search_index: SearchIndex,
         examples_map: BTreeMap<String, Vec<String>>,
         progguide_titles: BTreeMap<String, SearchDocument>,
+        profiles: BTreeMap<String, ProfileDefinition>,
+        search_assets: SearchBuildAssets,
+        doc_payloads: BTreeMap<String, String>,
     ) -> Self {
         Self {
             schema_version: INDEX_SCHEMA_VERSION,
@@ -134,40 +245,18 @@ impl BuiltIndex {
                 .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
             corpus_fingerprint,
             docset_stats,
+            profile_stats: search_assets.profile_stats,
+            profiles,
             root_index,
             search_index,
+            prepared_search_rows: search_assets.prepared_search_rows,
+            exact_lookup: search_assets.exact_lookup,
+            profile_doc_ids: search_assets.profile_doc_ids,
             examples_map,
             progguide_titles,
+            doc_payloads,
         }
     }
-}
-
-fn non_zero(value: usize) -> NonZeroUsize {
-    NonZeroUsize::new(value).expect("cache size must be > 0")
-}
-
-#[derive(Clone)]
-struct PreparedDoc {
-    doc: SearchDocument,
-    docset: String,
-    doc_type: String,
-    interface_name: String,
-    categories: HashSet<String>,
-    hay_title: String,
-    hay_summary: String,
-    hay_keywords: String,
-    hay_categories: String,
-    hay_interface: String,
-    hay_type: String,
-}
-
-#[derive(Clone)]
-struct BaseScoredDoc {
-    score: i32,
-    doc: SearchDocument,
-    doc_type: String,
-    interface_name: String,
-    categories: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -176,34 +265,42 @@ pub struct SearchOptions {
     pub doc_type: Option<String>,
     pub interface_name: Option<String>,
     pub categories: HashSet<String>,
+    pub profiles: HashSet<String>,
     pub limit: Option<usize>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct IndexValidationSummary {
+    pub doc_count: usize,
+    pub payload_count: usize,
+    pub exact_key_count: usize,
+    pub profile_count: usize,
+}
+
+#[derive(Clone)]
+struct BaseScoredDoc {
+    doc_id: usize,
+    score: i32,
+    doc_type: String,
+    interface_name: String,
+    categories: Vec<String>,
+}
+
 pub struct DataStore {
-    root: PathBuf,
+    root: Option<PathBuf>,
     index: BuiltIndex,
-    prepared_docs: Vec<PreparedDoc>,
     search_base_cache: Mutex<LruCache<String, Vec<BaseScoredDoc>>>,
     search_filtered_cache: Mutex<LruCache<String, Vec<SearchResult>>>,
-    member_path_cache: Mutex<LruCache<String, Option<PathBuf>>>,
-    interface_path_cache: Mutex<LruCache<String, Option<PathBuf>>>,
-    enum_path_cache: Mutex<LruCache<String, Option<PathBuf>>>,
     json_cache: Mutex<LruCache<PathBuf, Value>>,
 }
 
 impl DataStore {
-    pub fn new(root: impl Into<PathBuf>, index: BuiltIndex) -> Self {
-        let prepared_docs = prepare_docs(index.search_index.documents.as_deref().unwrap_or(&[]));
-
+    pub fn new(root: Option<PathBuf>, index: BuiltIndex) -> Self {
         Self {
-            root: root.into(),
+            root,
             index,
-            prepared_docs,
             search_base_cache: Mutex::new(LruCache::new(non_zero(256))),
             search_filtered_cache: Mutex::new(LruCache::new(non_zero(1024))),
-            member_path_cache: Mutex::new(LruCache::new(non_zero(4096))),
-            interface_path_cache: Mutex::new(LruCache::new(non_zero(4096))),
-            enum_path_cache: Mutex::new(LruCache::new(non_zero(4096))),
             json_cache: Mutex::new(LruCache::new(non_zero(256))),
         }
     }
@@ -220,20 +317,75 @@ impl DataStore {
         &self.index.progguide_titles
     }
 
+    pub fn profiles(&self) -> &BTreeMap<String, ProfileDefinition> {
+        &self.index.profiles
+    }
+
+    pub fn profile_stats(&self) -> &BTreeMap<String, ProfileStats> {
+        &self.index.profile_stats
+    }
+
+    pub fn doc_profiles(&self, doc_id: usize) -> Vec<String> {
+        self.search_row(doc_id)
+            .map(|entry| entry.profiles.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn search_document(&self, doc_id: usize) -> Option<&SearchDocument> {
+        self.index
+            .search_index
+            .documents
+            .as_ref()
+            .and_then(|documents| documents.get(doc_id))
+    }
+
+    fn search_row(&self, doc_id: usize) -> Option<&PreparedSearchRow> {
+        self.index.prepared_search_rows.get(doc_id)
+    }
+
     fn docset_index(&self, docset: &str) -> Option<&DocsetIndex> {
         self.index
             .root_index
             .docsets
             .as_ref()
-            .and_then(|docsets| docsets.get(docset))
+            .and_then(|docsets| lookup_case_insensitive(docsets, docset).map(|(_, entry)| entry))
     }
 
-    fn full_doc_path(&self, relative_path: Option<&str>) -> Option<PathBuf> {
-        let relative_path = relative_path?;
-        if relative_path.is_empty() {
-            return None;
-        }
-        Some(self.root.join(relative_path))
+    fn full_doc_path(&self, payload_ref: &str) -> Option<PathBuf> {
+        self.root.as_ref().map(|root| root.join(payload_ref))
+    }
+
+    pub fn resolve_member_ref(
+        &self,
+        interface_name: Option<&str>,
+        member_name: Option<&str>,
+        docset: &str,
+    ) -> Option<String> {
+        let interface_name = interface_name?;
+        let member_name = member_name?;
+        let interfaces = self.docset_index(docset)?.interfaces.as_ref()?;
+        let (_, interface_entry) = lookup_case_insensitive(interfaces, interface_name)?;
+        let members = interface_entry.members.as_ref()?;
+        let (_, payload_ref) = lookup_case_insensitive(members, member_name)?;
+        Some(payload_ref.clone())
+    }
+
+    pub fn resolve_interface_ref(
+        &self,
+        interface_name: Option<&str>,
+        docset: &str,
+    ) -> Option<String> {
+        let interface_name = interface_name?;
+        let interfaces = self.docset_index(docset)?.interfaces.as_ref()?;
+        let (_, interface_entry) = lookup_case_insensitive(interfaces, interface_name)?;
+        interface_entry.file.clone()
+    }
+
+    pub fn resolve_enum_ref(&self, enum_name: Option<&str>, docset: &str) -> Option<String> {
+        let enum_name = enum_name?;
+        let enums = self.docset_index(docset)?.enums.as_ref()?;
+        let (_, payload_ref) = lookup_case_insensitive(enums, enum_name)?;
+        Some(payload_ref.clone())
     }
 
     pub fn resolve_member_path(
@@ -242,77 +394,37 @@ impl DataStore {
         member_name: Option<&str>,
         docset: &str,
     ) -> Option<PathBuf> {
-        let cache_key = format!(
-            "{}|{}|{}",
-            docset,
-            interface_name.unwrap_or_default(),
-            member_name.unwrap_or_default()
-        );
-
-        if let Ok(mut cache) = self.member_path_cache.lock() {
-            if let Some(cached) = cache.get(&cache_key) {
-                return cached.clone();
-            }
-        }
-
-        let resolved = self
-            .docset_index(docset)
-            .and_then(|entry| entry.interfaces.as_ref())
-            .and_then(|interfaces| interfaces.get(interface_name.unwrap_or_default()))
-            .and_then(|interface_entry| interface_entry.members.as_ref())
-            .and_then(|members| members.get(member_name.unwrap_or_default()))
-            .and_then(|relative| self.full_doc_path(Some(relative)));
-
-        if let Ok(mut cache) = self.member_path_cache.lock() {
-            cache.put(cache_key, resolved.clone());
-        }
-
-        resolved
+        self.resolve_member_ref(interface_name, member_name, docset)
+            .and_then(|payload_ref| self.full_doc_path(&payload_ref))
     }
 
-    pub fn resolve_interface_path(&self, interface_name: Option<&str>, docset: &str) -> Option<PathBuf> {
-        let cache_key = format!("{}|{}", docset, interface_name.unwrap_or_default());
-
-        if let Ok(mut cache) = self.interface_path_cache.lock() {
-            if let Some(cached) = cache.get(&cache_key) {
-                return cached.clone();
-            }
-        }
-
-        let resolved = self
-            .docset_index(docset)
-            .and_then(|entry| entry.interfaces.as_ref())
-            .and_then(|interfaces| interfaces.get(interface_name.unwrap_or_default()))
-            .and_then(|interface_entry| interface_entry.file.as_deref())
-            .and_then(|relative| self.full_doc_path(Some(relative)));
-
-        if let Ok(mut cache) = self.interface_path_cache.lock() {
-            cache.put(cache_key, resolved.clone());
-        }
-
-        resolved
+    pub fn resolve_interface_path(
+        &self,
+        interface_name: Option<&str>,
+        docset: &str,
+    ) -> Option<PathBuf> {
+        self.resolve_interface_ref(interface_name, docset)
+            .and_then(|payload_ref| self.full_doc_path(&payload_ref))
     }
 
     pub fn resolve_enum_path(&self, enum_name: Option<&str>, docset: &str) -> Option<PathBuf> {
-        let cache_key = format!("{}|{}", docset, enum_name.unwrap_or_default());
+        self.resolve_enum_ref(enum_name, docset)
+            .and_then(|payload_ref| self.full_doc_path(&payload_ref))
+    }
 
-        if let Ok(mut cache) = self.enum_path_cache.lock() {
-            if let Some(cached) = cache.get(&cache_key) {
-                return cached.clone();
-            }
+    pub fn fetch_payload(&self, payload_ref: &str) -> Result<Value> {
+        if let Some(payload) = self.index.doc_payloads.get(payload_ref) {
+            return serde_json::from_str(payload)
+                .with_context(|| format!("failed to parse embedded payload: {payload_ref}"));
         }
 
-        let resolved = self
-            .docset_index(docset)
-            .and_then(|entry| entry.enums.as_ref())
-            .and_then(|enums| enums.get(enum_name.unwrap_or_default()))
-            .and_then(|relative| self.full_doc_path(Some(relative)));
+        let Some(path) = self.full_doc_path(payload_ref) else {
+            bail!(
+                "payload not available in artifact and no data root is configured: {payload_ref}"
+            );
+        };
 
-        if let Ok(mut cache) = self.enum_path_cache.lock() {
-            cache.put(cache_key, resolved.clone());
-        }
-
-        resolved
+        self.read_json_file(&path)
     }
 
     fn normalize_query(query: &str) -> String {
@@ -323,8 +435,27 @@ impl DataStore {
             .join(" ")
     }
 
-    fn search_base_cached(&self, query_key: &str, docset: Option<&str>) -> Vec<BaseScoredDoc> {
-        let cache_key = format!("{}|{}", docset.unwrap_or_default(), query_key);
+    fn profile_candidates(&self, profiles: &HashSet<String>) -> Option<BTreeSet<usize>> {
+        if profiles.is_empty() {
+            return None;
+        }
+
+        let mut doc_ids = BTreeSet::new();
+        for profile in profiles {
+            if let Some(ids) = self.index.profile_doc_ids.get(profile) {
+                doc_ids.extend(ids.iter().copied());
+            }
+        }
+        Some(doc_ids)
+    }
+
+    fn search_base_cached(&self, query_key: &str, options: &SearchOptions) -> Vec<BaseScoredDoc> {
+        let cache_key = format!(
+            "{}|{}|{}",
+            options.docset.as_deref().unwrap_or_default(),
+            serialize_string_set(&options.profiles),
+            query_key
+        );
         if let Ok(mut cache) = self.search_base_cache.lock() {
             if let Some(cached) = cache.get(&cache_key) {
                 return cached.clone();
@@ -339,40 +470,28 @@ impl DataStore {
             return Vec::new();
         }
 
+        let candidate_ids = self.profile_candidates(&options.profiles);
+        let candidate_iter: Box<dyn Iterator<Item = usize>> = match candidate_ids {
+            Some(doc_ids) => Box::new(doc_ids.into_iter()),
+            None => Box::new(0..self.index.prepared_search_rows.len()),
+        };
+
         let mut scored = Vec::new();
-        for item in &self.prepared_docs {
-            if let Some(docset) = docset {
+        for doc_id in candidate_iter {
+            let Some(item) = self.search_row(doc_id) else {
+                continue;
+            };
+            if let Some(docset) = options.docset.as_deref() {
                 if item.docset != docset {
                     continue;
                 }
             }
 
-            let mut score = 0;
-            for token in &tokens {
-                if item.hay_title.contains(token) {
-                    score += 4;
-                }
-                if item.hay_keywords.contains(token) {
-                    score += 3;
-                }
-                if item.hay_interface.contains(token) {
-                    score += 2;
-                }
-                if item.hay_summary.contains(token) {
-                    score += 1;
-                }
-                if item.hay_categories.contains(token) {
-                    score += 1;
-                }
-                if item.hay_type.contains(token) {
-                    score += 1;
-                }
-            }
-
+            let score = score_prepared_row(item, tokens.iter().map(String::as_str));
             if score > 0 {
                 scored.push(BaseScoredDoc {
+                    doc_id: item.doc_id,
                     score,
-                    doc: item.doc.clone(),
                     doc_type: item.doc_type.clone(),
                     interface_name: item.interface_name.clone(),
                     categories: item.categories.clone(),
@@ -380,7 +499,12 @@ impl DataStore {
             }
         }
 
-        scored.sort_by(|left, right| right.score.cmp(&left.score));
+        scored.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then(left.doc_id.cmp(&right.doc_id))
+        });
 
         if let Ok(mut cache) = self.search_base_cache.lock() {
             cache.put(cache_key, scored.clone());
@@ -389,16 +513,21 @@ impl DataStore {
         scored
     }
 
-    fn search_filtered_cached(&self, query_key: &str, options: &SearchOptions) -> Vec<SearchResult> {
+    fn search_filtered_cached(
+        &self,
+        query_key: &str,
+        options: &SearchOptions,
+    ) -> Vec<SearchResult> {
         let mut category_list = options.categories.iter().cloned().collect::<Vec<_>>();
         category_list.sort();
 
         let cache_key = format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             options.docset.as_deref().unwrap_or_default(),
             options.doc_type.as_deref().unwrap_or_default(),
             options.interface_name.as_deref().unwrap_or_default(),
             category_list.join(","),
+            serialize_string_set(&options.profiles),
             query_key,
         );
 
@@ -408,7 +537,7 @@ impl DataStore {
             }
         }
 
-        let base = self.search_base_cached(query_key, options.docset.as_deref());
+        let base = self.search_base_cached(query_key, options);
         let mut filtered = Vec::new();
         for item in base {
             if let Some(doc_type) = options.doc_type.as_deref() {
@@ -417,19 +546,26 @@ impl DataStore {
                 }
             }
             if let Some(interface_name) = options.interface_name.as_deref() {
-                if item.interface_name != interface_name {
+                if !item.interface_name.eq_ignore_ascii_case(interface_name) {
                     continue;
                 }
             }
             if !options.categories.is_empty()
-                && !options.categories.iter().all(|entry| item.categories.contains(entry))
+                && !options
+                    .categories
+                    .iter()
+                    .all(|entry| item.categories.iter().any(|candidate| candidate == entry))
             {
                 continue;
             }
 
+            let Some(doc) = self.search_document(item.doc_id) else {
+                continue;
+            };
             filtered.push(SearchResult {
+                doc_id: item.doc_id,
                 score: item.score,
-                doc: item.doc,
+                doc: doc.clone(),
             });
         }
 
@@ -440,23 +576,62 @@ impl DataStore {
         filtered
     }
 
+    fn exact_search(&self, query: &str, options: &SearchOptions) -> Vec<SearchResult> {
+        let mut doc_ids = BTreeSet::new();
+        for key in exact_query_keys(query) {
+            if let Some(ids) = self.index.exact_lookup.get(&key) {
+                doc_ids.extend(ids.iter().copied());
+            }
+        }
+
+        let mut results = Vec::new();
+        for doc_id in doc_ids {
+            let Some(row) = self.search_row(doc_id) else {
+                continue;
+            };
+            if !matches_row_filters(row, options) {
+                continue;
+            }
+            let Some(doc) = self.search_document(doc_id) else {
+                continue;
+            };
+
+            results.push(SearchResult {
+                doc_id,
+                score: 10_000,
+                doc: doc.clone(),
+            });
+        }
+
+        results
+    }
+
     pub fn search_api_scored(&self, query: &str, options: &SearchOptions) -> Vec<SearchResult> {
         let query_key = Self::normalize_query(query);
         if query_key.is_empty() {
             return Vec::new();
         }
 
-        let mut results = self.search_filtered_cached(&query_key, options);
-        match options.limit {
-            Some(0) => Vec::new(),
-            Some(limit) => {
-                if results.len() > limit {
-                    results.truncate(limit);
-                }
-                results
-            }
-            None => results,
+        let exact_results = self.exact_search(query, options);
+        if !exact_results.is_empty() && looks_like_exact_symbol(query) {
+            return apply_limit(exact_results, options.limit);
         }
+
+        let fuzzy_results = self.search_filtered_cached(&query_key, options);
+        if exact_results.is_empty() {
+            return apply_limit(fuzzy_results, options.limit);
+        }
+
+        let mut merged = Vec::new();
+        let mut seen_doc_ids = HashSet::new();
+
+        for entry in exact_results.into_iter().chain(fuzzy_results.into_iter()) {
+            if seen_doc_ids.insert(entry.doc_id) {
+                merged.push(entry);
+            }
+        }
+
+        apply_limit(merged, options.limit)
     }
 
     pub fn read_json_file(&self, path: &Path) -> Result<Value> {
@@ -481,39 +656,466 @@ impl DataStore {
     }
 }
 
-fn prepare_docs(docs: &[SearchDocument]) -> Vec<PreparedDoc> {
-    docs.iter()
-        .map(|doc| {
-            let categories = doc.categories_slice().iter().cloned().collect::<HashSet<_>>();
-            PreparedDoc {
-                doc: doc.clone(),
-                docset: doc.docset_str().to_string(),
-                doc_type: doc.doc_type_str().to_string(),
-                interface_name: doc.interface_str().to_string(),
-                categories,
-                hay_title: doc.title_str().to_ascii_lowercase(),
-                hay_summary: doc.summary_str().to_ascii_lowercase(),
-                hay_keywords: doc
-                    .keywords_slice()
-                    .iter()
-                    .map(|entry| entry.to_ascii_lowercase())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                hay_categories: doc
-                    .categories_slice()
-                    .iter()
-                    .map(|entry| entry.to_ascii_lowercase())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                hay_interface: doc.interface_str().to_ascii_lowercase(),
-                hay_type: doc.doc_type_str().to_ascii_lowercase(),
-            }
-        })
-        .collect()
+fn non_zero(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).expect("cache size must be > 0")
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn apply_limit(mut results: Vec<SearchResult>, limit: Option<usize>) -> Vec<SearchResult> {
+    match limit {
+        Some(0) => Vec::new(),
+        Some(limit) => {
+            if results.len() > limit {
+                results.truncate(limit);
+            }
+            results
+        }
+        None => results,
+    }
+}
+
+fn serialize_string_set(values: &HashSet<String>) -> String {
+    let mut ordered = values.iter().cloned().collect::<Vec<_>>();
+    ordered.sort();
+    ordered.join(",")
+}
+
+fn score_fields<'a, I>(
+    tokens: I,
+    hay_title: &str,
+    hay_summary: &str,
+    hay_keywords: &str,
+    hay_categories: &str,
+    hay_interface: &str,
+    hay_type: &str,
+) -> i32
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut score = 0;
+    for token in tokens {
+        if hay_title.contains(token) {
+            score += 4;
+        }
+        if hay_keywords.contains(token) {
+            score += 3;
+        }
+        if hay_interface.contains(token) {
+            score += 2;
+        }
+        if hay_summary.contains(token) {
+            score += 1;
+        }
+        if hay_categories.contains(token) {
+            score += 1;
+        }
+        if hay_type.contains(token) {
+            score += 1;
+        }
+    }
+    score
+}
+
+fn score_prepared_row<'a, I>(row: &PreparedSearchRow, tokens: I) -> i32
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    score_fields(
+        tokens,
+        &row.hay_title,
+        &row.hay_summary,
+        &row.hay_keywords,
+        &row.hay_categories,
+        &row.hay_interface,
+        &row.hay_type,
+    )
+}
+
+fn normalize_exact_key(value: &str) -> String {
+    value.trim().replace("::", ".").to_ascii_lowercase()
+}
+
+fn exact_query_keys(query: &str) -> Vec<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut keys = BTreeSet::new();
+    keys.insert(normalize_exact_key(trimmed));
+    if trimmed.contains("::") {
+        keys.insert(normalize_exact_key(&trimmed.replace("::", ".")));
+    }
+    keys.into_iter().collect()
+}
+
+fn doc_exact_keys(doc: &SearchDocument) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    if let Some(id) = doc.id.as_deref() {
+        keys.insert(normalize_exact_key(id));
+    }
+
+    let title = doc.title_str().trim();
+    let interface_name = doc.interface_str().trim();
+    if !title.is_empty() {
+        keys.insert(normalize_exact_key(title));
+    }
+    if !interface_name.is_empty() {
+        keys.insert(normalize_exact_key(interface_name));
+        if !title.is_empty() {
+            keys.insert(normalize_exact_key(&format!("{interface_name}.{title}")));
+        }
+    }
+
+    keys.into_iter().collect()
+}
+
+fn looks_like_exact_symbol(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return false;
+    }
+
+    trimmed.contains('.')
+        || trimmed.contains("::")
+        || trimmed.ends_with("_e")
+        || (trimmed.starts_with('I')
+            && trimmed
+                .chars()
+                .nth(1)
+                .map(|entry| entry.is_ascii_uppercase())
+                .unwrap_or(false))
+}
+
+fn matches_row_filters(row: &PreparedSearchRow, options: &SearchOptions) -> bool {
+    if let Some(docset) = options.docset.as_deref() {
+        if row.docset != docset {
+            return false;
+        }
+    }
+    if let Some(doc_type) = options.doc_type.as_deref() {
+        if row.doc_type != doc_type {
+            return false;
+        }
+    }
+    if let Some(interface_name) = options.interface_name.as_deref() {
+        if !row.interface_name.eq_ignore_ascii_case(interface_name) {
+            return false;
+        }
+    }
+    if !options.categories.is_empty()
+        && !options
+            .categories
+            .iter()
+            .all(|entry| row.categories.iter().any(|candidate| candidate == entry))
+    {
+        return false;
+    }
+    if !options.profiles.is_empty()
+        && !row
+            .profiles
+            .iter()
+            .any(|profile| options.profiles.contains(profile))
+    {
+        return false;
+    }
+
+    true
+}
+
+fn lookup_case_insensitive<'a, T>(
+    values: &'a BTreeMap<String, T>,
+    key: &str,
+) -> Option<(&'a String, &'a T)> {
+    values.get_key_value(key).or_else(|| {
+        values
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+    })
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|entry| (*entry).to_string()).collect()
+}
+
+pub fn default_profile_catalog() -> BTreeMap<String, ProfileDefinition> {
+    BTreeMap::from([
+        (
+            "assemblies".to_string(),
+            ProfileDefinition {
+                description: "Assembly-focused interfaces, members, and related search results."
+                    .to_string(),
+                docsets: strings(&["sldworksapi"]),
+                categories_any: strings(&["assemblies"]),
+                ..ProfileDefinition::default()
+            },
+        ),
+        (
+            "drawings".to_string(),
+            ProfileDefinition {
+                description: "Drawing documents, annotations, sheets, and related APIs."
+                    .to_string(),
+                docsets: strings(&["sldworksapi"]),
+                categories_any: strings(&["drawings"]),
+                ..ProfileDefinition::default()
+            },
+        ),
+        (
+            "sketching".to_string(),
+            ProfileDefinition {
+                description: "Sketch creation and sketch editing APIs.".to_string(),
+                docsets: strings(&["sldworksapi"]),
+                categories_any: strings(&["sketches"]),
+                ..ProfileDefinition::default()
+            },
+        ),
+        (
+            "features".to_string(),
+            ProfileDefinition {
+                description: "Feature creation, definition, and feature-data APIs.".to_string(),
+                docsets: strings(&["sldworksapi"]),
+                categories_any: strings(&["features"]),
+                ..ProfileDefinition::default()
+            },
+        ),
+        (
+            "documents_file_io".to_string(),
+            ProfileDefinition {
+                description: "Document lifecycle and file import/export operations.".to_string(),
+                docsets: strings(&["sldworksapi"]),
+                categories_any: strings(&["file-io"]),
+                ..ProfileDefinition::default()
+            },
+        ),
+        (
+            "macros_addins".to_string(),
+            ProfileDefinition {
+                description: "Guides and examples for macros, add-ins, and standalone automation."
+                    .to_string(),
+                docsets: strings(&["progguide"]),
+                types: strings(&["pattern"]),
+                title_terms: strings(&["macro", "add-in", "addin"]),
+                keyword_terms: strings(&["macro", "addin", "standalone", "application"]),
+                ..ProfileDefinition::default()
+            },
+        ),
+        (
+            "constants_reference".to_string(),
+            ProfileDefinition {
+                description: "SolidWorks constant enums and reference values.".to_string(),
+                docsets: strings(&["swconst"]),
+                types: strings(&["enum"]),
+                ..ProfileDefinition::default()
+            },
+        ),
+    ])
+}
+
+pub fn build_search_assets(
+    search: &SearchIndex,
+    profiles: &BTreeMap<String, ProfileDefinition>,
+) -> SearchBuildAssets {
+    let documents = search.documents.as_deref().unwrap_or(&[]);
+    let mut prepared_search_rows = Vec::with_capacity(documents.len());
+    let mut exact_lookup: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut profile_doc_ids = profiles
+        .keys()
+        .cloned()
+        .map(|name| (name, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut profile_stats = profiles
+        .keys()
+        .cloned()
+        .map(|name| (name, ProfileStats::default()))
+        .collect::<BTreeMap<_, _>>();
+
+    for (doc_id, doc) in documents.iter().enumerate() {
+        let categories = doc
+            .categories_slice()
+            .iter()
+            .map(|entry| entry.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let matched_profiles = profiles
+            .iter()
+            .filter_map(|(name, profile)| profile.matches(doc).then_some(name.clone()))
+            .collect::<Vec<_>>();
+        let exact_keys = doc_exact_keys(doc);
+
+        for exact_key in &exact_keys {
+            exact_lookup
+                .entry(exact_key.clone())
+                .or_default()
+                .push(doc_id);
+        }
+        for profile_name in &matched_profiles {
+            profile_doc_ids
+                .entry(profile_name.clone())
+                .or_default()
+                .push(doc_id);
+            if let Some(stats) = profile_stats.get_mut(profile_name) {
+                stats.doc_count += 1;
+            }
+        }
+
+        prepared_search_rows.push(PreparedSearchRow {
+            doc_id,
+            docset: doc.docset_str().to_ascii_lowercase(),
+            doc_type: doc.doc_type_str().to_ascii_lowercase(),
+            interface_name: doc.interface_str().to_string(),
+            hay_title: doc.title_str().to_ascii_lowercase(),
+            hay_summary: doc.summary_str().to_ascii_lowercase(),
+            hay_keywords: doc
+                .keywords_slice()
+                .iter()
+                .map(|entry| entry.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(" "),
+            hay_categories: categories.join(" "),
+            hay_interface: doc.interface_str().to_ascii_lowercase(),
+            hay_type: doc.doc_type_str().to_ascii_lowercase(),
+            categories,
+            exact_keys,
+            profiles: matched_profiles,
+        });
+    }
+
+    for entries in exact_lookup.values_mut() {
+        entries.sort_unstable();
+        entries.dedup();
+    }
+    for entries in profile_doc_ids.values_mut() {
+        entries.sort_unstable();
+        entries.dedup();
+    }
+
+    SearchBuildAssets {
+        prepared_search_rows,
+        exact_lookup,
+        profile_doc_ids,
+        profile_stats,
+    }
+}
+
+pub fn referenced_payload_refs(root_index: &RootIndex) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
+
+    if let Some(docsets) = root_index.docsets.as_ref() {
+        for docset in docsets.values() {
+            if let Some(interfaces) = docset.interfaces.as_ref() {
+                for interface in interfaces.values() {
+                    if let Some(file) = interface.file.as_deref() {
+                        refs.insert(file.to_string());
+                    }
+                    if let Some(members) = interface.members.as_ref() {
+                        refs.extend(members.values().cloned());
+                    }
+                }
+            }
+            if let Some(enums) = docset.enums.as_ref() {
+                refs.extend(enums.values().cloned());
+            }
+        }
+    }
+
+    refs
+}
+
+pub fn load_referenced_payloads(
+    root: &Path,
+    root_index: &RootIndex,
+) -> Result<BTreeMap<String, String>> {
+    let mut payloads = BTreeMap::new();
+    for payload_ref in referenced_payload_refs(root_index) {
+        let path = root.join(&payload_ref);
+        let payload = fs::read_to_string(&path)
+            .with_context(|| format!("failed to load fetch payload: {}", path.display()))?;
+        payloads.insert(payload_ref, payload);
+    }
+
+    Ok(payloads)
+}
+
+pub fn validate_built_index(index: &BuiltIndex) -> Result<IndexValidationSummary> {
+    let documents = index.search_index.documents.as_deref().unwrap_or(&[]);
+    if documents.is_empty() {
+        bail!("index appears incomplete (docs: 0)");
+    }
+
+    if index.prepared_search_rows.len() != documents.len() {
+        bail!(
+            "prepared search rows mismatch: expected {}, got {}",
+            documents.len(),
+            index.prepared_search_rows.len()
+        );
+    }
+
+    let mut seen_doc_ids = HashSet::new();
+    for row in &index.prepared_search_rows {
+        if row.doc_id >= documents.len() {
+            bail!(
+                "prepared search row points to missing doc id {}",
+                row.doc_id
+            );
+        }
+        if !seen_doc_ids.insert(row.doc_id) {
+            bail!("duplicate prepared search row for doc id {}", row.doc_id);
+        }
+    }
+
+    for (exact_key, doc_ids) in &index.exact_lookup {
+        if exact_key.trim().is_empty() {
+            bail!("exact lookup contains an empty key");
+        }
+        for doc_id in doc_ids {
+            if *doc_id >= documents.len() {
+                bail!("exact lookup points to missing doc id {}", doc_id);
+            }
+        }
+    }
+
+    for (profile_name, doc_ids) in &index.profile_doc_ids {
+        if !index.profiles.contains_key(profile_name) {
+            bail!("profile doc ids contain unknown profile {profile_name}");
+        }
+        for doc_id in doc_ids {
+            if *doc_id >= documents.len() {
+                bail!("profile doc ids point to missing doc id {}", doc_id);
+            }
+        }
+        let expected = doc_ids.len() as u64;
+        let actual = index
+            .profile_stats
+            .get(profile_name)
+            .map(|entry| entry.doc_count)
+            .unwrap_or_default();
+        if expected != actual {
+            bail!("profile stats mismatch for {profile_name}: expected {expected}, got {actual}");
+        }
+    }
+
+    for payload_ref in referenced_payload_refs(&index.root_index) {
+        if !index.doc_payloads.contains_key(&payload_ref) {
+            bail!("missing embedded payload for {}", payload_ref);
+        }
+    }
+
+    for titles in index.examples_map.values() {
+        for title in titles {
+            if !index.progguide_titles.contains_key(title) {
+                bail!("examples map references missing progguide title {}", title);
+            }
+        }
+    }
+
+    Ok(IndexValidationSummary {
+        doc_count: documents.len(),
+        payload_count: index.doc_payloads.len(),
+        exact_key_count: index.exact_lookup.len(),
+        profile_count: index.profiles.len(),
+    })
 }
 
 pub fn tokenize(text: Option<&str>) -> Vec<String> {
@@ -549,28 +1151,15 @@ where
     let hay_interface = doc.interface_str().to_ascii_lowercase();
     let hay_type = doc.doc_type_str().to_ascii_lowercase();
 
-    let mut score = 0;
-    for token in tokens {
-        if hay_title.contains(token) {
-            score += 4;
-        }
-        if hay_keywords.contains(token) {
-            score += 3;
-        }
-        if hay_interface.contains(token) {
-            score += 2;
-        }
-        if hay_summary.contains(token) {
-            score += 1;
-        }
-        if hay_categories.contains(token) {
-            score += 1;
-        }
-        if hay_type.contains(token) {
-            score += 1;
-        }
-    }
-    score
+    score_fields(
+        tokens,
+        &hay_title,
+        &hay_summary,
+        &hay_keywords,
+        &hay_categories,
+        &hay_interface,
+        &hay_type,
+    )
 }
 
 pub fn parse_limit(value: Option<&Value>, default_value: Option<usize>) -> Option<usize> {
@@ -623,7 +1212,10 @@ pub fn write_index_artifact(path: &Path, index: &BuiltIndex) -> Result<()> {
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create output directory for index artifact: {}", parent.display())
+            format!(
+                "failed to create output directory for index artifact: {}",
+                parent.display()
+            )
         })?;
     }
 
@@ -632,7 +1224,8 @@ pub fn write_index_artifact(path: &Path, index: &BuiltIndex) -> Result<()> {
 }
 
 pub fn read_index_artifact(path: &Path) -> Result<BuiltIndex> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read index artifact: {}", path.display()))?;
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read index artifact: {}", path.display()))?;
     if bytes.len() < INDEX_MAGIC.len() + 12 {
         bail!("index artifact is too small: {}", path.display());
     }
@@ -655,7 +1248,8 @@ pub fn read_index_artifact(path: &Path) -> Result<BuiltIndex> {
     let (length_bytes, compressed) = rest.split_at(8);
     let expected_len = u64::from_le_bytes(length_bytes.try_into().unwrap_or([0; 8])) as usize;
 
-    let payload = zstd::stream::decode_all(Cursor::new(compressed)).context("failed to decompress index payload")?;
+    let payload = zstd::stream::decode_all(Cursor::new(compressed))
+        .context("failed to decompress index payload")?;
     if payload.len() != expected_len {
         bail!(
             "index payload length mismatch: expected {}, got {}",
@@ -718,7 +1312,9 @@ pub fn compute_corpus_fingerprint(root: &Path) -> Result<String> {
 pub fn resolve_data_root(env_value: Option<&str>) -> PathBuf {
     if let Some(raw) = env_value {
         if !raw.trim().is_empty() {
-            return PathBuf::from(raw).canonicalize().unwrap_or_else(|_| PathBuf::from(raw));
+            return PathBuf::from(raw)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(raw));
         }
     }
 
@@ -795,7 +1391,7 @@ pub fn parse_categories(value: Option<&Value>) -> HashSet<String> {
         .and_then(Value::as_array)
         .into_iter()
         .flat_map(|entries| entries.iter())
-        .filter_map(|entry| entry.as_str().map(str::to_string))
+        .filter_map(|entry| entry.as_str().map(|value| value.to_ascii_lowercase()))
         .collect()
 }
 
@@ -813,6 +1409,132 @@ pub fn require_directory(path: &Path, label: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn search_doc(
+        id: &str,
+        title: &str,
+        interface_name: &str,
+        doc_type: &str,
+        docset: &str,
+        categories: &[&str],
+        keywords: &[&str],
+    ) -> SearchDocument {
+        SearchDocument {
+            id: Some(id.to_string()),
+            path: Some(format!("json/{id}.json")),
+            title: Some(title.to_string()),
+            summary: Some(format!("{title} summary")),
+            keywords: Some(strings(keywords)),
+            categories: Some(strings(categories)),
+            interface_name: Some(interface_name.to_string()),
+            doc_type: Some(doc_type.to_string()),
+            docset: Some(docset.to_string()),
+            ..SearchDocument::default()
+        }
+    }
+
+    fn test_index() -> BuiltIndex {
+        let search_index = SearchIndex {
+            documents: Some(vec![
+                search_doc(
+                    "IAssemblyDoc.AddComponent",
+                    "AddComponent",
+                    "IAssemblyDoc",
+                    "method",
+                    "sldworksapi",
+                    &["assemblies"],
+                    &["assembly", "component"],
+                ),
+                search_doc(
+                    "IModelDoc2.Save3",
+                    "Save3",
+                    "IModelDoc2",
+                    "method",
+                    "sldworksapi",
+                    &["documents", "file-io"],
+                    &["save", "document"],
+                ),
+                SearchDocument {
+                    title: Some("Macro Best Practices".to_string()),
+                    summary: Some("macro setup".to_string()),
+                    keywords: Some(strings(&["macro", "addin"])),
+                    categories: Some(strings(&["documents"])),
+                    interface_name: Some(String::new()),
+                    doc_type: Some("pattern".to_string()),
+                    docset: Some("progguide".to_string()),
+                    ..SearchDocument::default()
+                },
+                SearchDocument {
+                    title: Some("swAddMateError_e".to_string()),
+                    summary: Some("Mate error enum".to_string()),
+                    keywords: Some(strings(&["mate", "error"])),
+                    categories: Some(strings(&["constants"])),
+                    interface_name: Some(String::new()),
+                    doc_type: Some("enum".to_string()),
+                    docset: Some("swconst".to_string()),
+                    ..SearchDocument::default()
+                },
+            ]),
+        };
+
+        let root_index: RootIndex = serde_json::from_value(serde_json::json!({
+            "docsets": {
+                "sldworksapi": {
+                    "interfaces": {
+                        "IAssemblyDoc": {
+                            "file": "json/sldworksapi/interfaces/IAssemblyDoc/_interface.json",
+                            "members": {
+                                "AddComponent": "json/sldworksapi/interfaces/IAssemblyDoc/AddComponent.json"
+                            }
+                        },
+                        "IModelDoc2": {
+                            "members": {
+                                "Save3": "json/sldworksapi/interfaces/IModelDoc2/Save3.json"
+                            }
+                        }
+                    }
+                },
+                "swconst": {
+                    "enums": {
+                        "swAddMateError_e": "json/swconst/enums/swAddMateError_e.json"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let profiles = default_profile_catalog();
+        let search_assets = build_search_assets(&search_index, &profiles);
+
+        BuiltIndex::new(
+            "fingerprint".to_string(),
+            BTreeMap::new(),
+            root_index,
+            search_index,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            profiles,
+            search_assets,
+            BTreeMap::from([
+                (
+                    "json/sldworksapi/interfaces/IAssemblyDoc/AddComponent.json".to_string(),
+                    serde_json::json!({ "related": ["IAssemblyDoc.AddComponent2"] }).to_string(),
+                ),
+                (
+                    "json/sldworksapi/interfaces/IAssemblyDoc/_interface.json".to_string(),
+                    serde_json::json!({ "title": "IAssemblyDoc" }).to_string(),
+                ),
+                (
+                    "json/sldworksapi/interfaces/IModelDoc2/Save3.json".to_string(),
+                    serde_json::json!({ "examples": [{ "title": "Save File (C#)" }] }).to_string(),
+                ),
+                (
+                    "json/swconst/enums/swAddMateError_e.json".to_string(),
+                    serde_json::json!({ "values": [] }).to_string(),
+                ),
+            ]),
+        )
+    }
+
     #[test]
     fn tokenize_basic_words() {
         assert_eq!(tokenize(Some("Hello World")), vec!["hello", "world"]);
@@ -820,7 +1542,10 @@ mod tests {
 
     #[test]
     fn tokenize_splits_special_characters() {
-        assert_eq!(tokenize(Some("get_feature-data!")), vec!["get", "feature", "data"]);
+        assert_eq!(
+            tokenize(Some("get_feature-data!")),
+            vec!["get", "feature", "data"]
+        );
     }
 
     #[test]
@@ -865,6 +1590,75 @@ mod tests {
             mapping.get("ISldWorks.OpenDoc"),
             Some(&vec!["Example One".to_string()])
         );
-        assert_eq!(mapping.get("IFoo.Bar"), Some(&vec!["Example Two".to_string()]));
+        assert_eq!(
+            mapping.get("IFoo.Bar"),
+            Some(&vec!["Example Two".to_string()])
+        );
+    }
+
+    #[test]
+    fn default_profiles_match_expected_documents() {
+        let search_index = SearchIndex {
+            documents: Some(vec![
+                search_doc(
+                    "IAssemblyDoc.AddComponent",
+                    "AddComponent",
+                    "IAssemblyDoc",
+                    "method",
+                    "sldworksapi",
+                    &["assemblies"],
+                    &["assembly"],
+                ),
+                SearchDocument {
+                    title: Some("Macro Best Practices".to_string()),
+                    summary: Some("macro setup".to_string()),
+                    keywords: Some(strings(&["macro", "addin"])),
+                    categories: Some(strings(&["documents"])),
+                    interface_name: Some(String::new()),
+                    doc_type: Some("pattern".to_string()),
+                    docset: Some("progguide".to_string()),
+                    ..SearchDocument::default()
+                },
+            ]),
+        };
+
+        let profiles = default_profile_catalog();
+        let assets = build_search_assets(&search_index, &profiles);
+
+        assert_eq!(
+            assets
+                .profile_stats
+                .get("assemblies")
+                .map(|entry| entry.doc_count),
+            Some(1)
+        );
+        assert_eq!(
+            assets
+                .profile_stats
+                .get("macros_addins")
+                .map(|entry| entry.doc_count),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn search_api_scored_prefers_exact_symbol() {
+        let store = DataStore::new(None, test_index());
+        let results = store.search_api_scored("IModelDoc2.Save3", &SearchOptions::default());
+
+        assert_eq!(
+            results.first().and_then(|entry| entry.doc.title.as_deref()),
+            Some("Save3")
+        );
+        assert!(results.first().map(|entry| entry.score).unwrap_or_default() >= 10_000);
+    }
+
+    #[test]
+    fn validate_built_index_detects_missing_payloads() {
+        let mut index = test_index();
+        index.doc_payloads.clear();
+
+        let error = validate_built_index(&index).unwrap_err().to_string();
+        assert!(error.contains("missing embedded payload"));
     }
 }
